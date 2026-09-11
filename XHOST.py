@@ -21,6 +21,150 @@ import requests
 import hashlib
 import mimetypes
 import struct
+from urllib.parse import quote
+
+# --- Supabase Persistent Storage ---
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_SECRET_KEY = os.environ.get("SUPABASE_SECRET_KEY", "")
+SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "XHOST")
+SUPABASE_REST_URL = f"{SUPABASE_URL}/rest/v1" if SUPABASE_URL else ""
+SUPABASE_STORAGE_URL = f"{SUPABASE_URL}/storage/v1/object" if SUPABASE_URL else ""
+
+def _supabase_headers(content_type=None):
+    if not SUPABASE_URL or not SUPABASE_SECRET_KEY:
+        raise RuntimeError("SUPABASE_URL and SUPABASE_SECRET_KEY environment variables are required")
+    headers = {
+        "apikey": SUPABASE_SECRET_KEY,
+        "Authorization": f"Bearer {SUPABASE_SECRET_KEY}",
+    }
+    if content_type:
+        headers["Content-Type"] = content_type
+    return headers
+
+def supabase_request(method, table, params=None, json_body=None):
+    url = f"{SUPABASE_REST_URL}/{table}"
+    headers = _supabase_headers("application/json")
+    if method.upper() in ("POST", "PATCH"):
+        headers["Prefer"] = "resolution=merge-duplicates,return=minimal"
+    response = requests.request(method, url, headers=headers, params=params, json=json_body, timeout=30)
+    if not response.ok:
+        raise RuntimeError(f"Supabase {method} {table} failed ({response.status_code}): {response.text[:500]}")
+    if not response.text:
+        return []
+    try:
+        return response.json()
+    except ValueError:
+        return []
+
+def supabase_storage_path(user_id, relative_path):
+    relative_path = relative_path.replace(os.sep, "/").lstrip("/")
+    return f"{user_id}/{relative_path}"
+
+def supabase_storage_upload(local_path, user_id, relative_path):
+    object_path = supabase_storage_path(user_id, relative_path)
+    url = f"{SUPABASE_STORAGE_URL}/{quote(SUPABASE_BUCKET, safe='')}/{quote(object_path, safe='/')}"
+    with open(local_path, "rb") as f:
+        data = f.read()
+    headers = _supabase_headers("application/octet-stream")
+    headers["x-upsert"] = "true"
+    response = requests.post(url, headers=headers, data=data, timeout=60)
+    if not response.ok:
+        raise RuntimeError(f"Supabase Storage upload failed ({response.status_code}): {response.text[:500]}")
+
+def supabase_storage_download(user_id, object_path, local_path):
+    url = f"{SUPABASE_STORAGE_URL}/{quote(SUPABASE_BUCKET, safe='')}/{quote(object_path, safe='/')}"
+    response = requests.get(url, headers=_supabase_headers(), timeout=60)
+    if response.status_code == 404:
+        return False
+    if not response.ok:
+        raise RuntimeError(f"Supabase Storage download failed ({response.status_code}): {response.text[:500]}")
+    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+    with open(local_path, "wb") as f:
+        f.write(response.content)
+    return True
+
+def supabase_storage_delete(user_id, relative_path):
+    object_path = supabase_storage_path(user_id, relative_path)
+    url = f"{SUPABASE_STORAGE_URL}/{quote(SUPABASE_BUCKET, safe='')}/{quote(object_path, safe='/')}"
+    response = requests.delete(url, headers=_supabase_headers(), timeout=30)
+    if not response.ok and response.status_code != 404:
+        raise RuntimeError(f"Supabase Storage delete failed ({response.status_code}): {response.text[:500]}")
+
+def sync_user_folder_to_supabase(user_id, user_folder):
+    """Upload persistent user files to Supabase Storage; skip runtime logs/node_modules."""
+    uploaded = 0
+    if not os.path.isdir(user_folder):
+        return 0
+    for root, dirs, files in os.walk(user_folder):
+        dirs[:] = [d for d in dirs if d != "node_modules" and not d.startswith(".")]
+        for filename in files:
+            if filename.endswith(".log"):
+                continue
+            local_path = os.path.join(root, filename)
+            relative_path = os.path.relpath(local_path, user_folder)
+            try:
+                supabase_storage_upload(local_path, user_id, relative_path)
+                uploaded += 1
+            except Exception as e:
+                logger.error(f"Supabase Storage upload failed for {local_path}: {e}")
+                raise
+    logger.info(f"☁️ Synced {uploaded} file(s) for user {user_id} to Supabase Storage.")
+    return uploaded
+
+def restore_user_folder_from_supabase(user_id, user_folder):
+    """Restore a user's persistent files from Supabase Storage into Render's temporary disk."""
+    os.makedirs(user_folder, exist_ok=True)
+    prefix = f"{user_id}/"
+    url = f"{SUPABASE_URL}/storage/v1/object/list/{quote(SUPABASE_BUCKET, safe='')}"
+    headers = _supabase_headers("application/json")
+    restored = 0
+
+    def list_objects(current_prefix):
+        offset = 0
+        while True:
+            response = requests.post(
+                url, headers=headers,
+                json={"prefix": current_prefix, "limit": 1000, "offset": offset,
+                      "sortBy": {"column": "name", "order": "asc"}},
+                timeout=30
+            )
+            if not response.ok:
+                raise RuntimeError(f"Supabase Storage list failed ({response.status_code}): {response.text[:500]}")
+            entries = response.json() or []
+            if not entries:
+                break
+            for entry in entries:
+                name = entry.get("name")
+                if not name:
+                    continue
+                # Supabase represents folders as entries without an object id.
+                if entry.get("id") is None:
+                    nested_prefix = current_prefix + name.rstrip("/") + "/"
+                    yield from list_objects(nested_prefix)
+                else:
+                    yield current_prefix + name
+            if len(entries) < 1000:
+                break
+            offset += len(entries)
+
+    for object_path in list_objects(prefix):
+        relative_path = object_path[len(prefix):]
+        if not relative_path or relative_path.endswith("/"):
+            continue
+        # Never restore runtime logs or node_modules.
+        if relative_path.endswith(".log") or relative_path == "node_modules" or relative_path.startswith("node_modules/"):
+            continue
+        local_path = os.path.join(user_folder, relative_path.replace("/", os.sep))
+        if supabase_storage_download(user_id, object_path, local_path):
+            restored += 1
+
+    logger.info(f"☁️ Restored {restored} file(s) for user {user_id} from Supabase Storage.")
+    return restored
+
+def sync_single_file_to_supabase(user_id, file_path, user_folder):
+    relative_path = os.path.relpath(file_path, user_folder)
+    return supabase_storage_upload(file_path, user_id, relative_path)
+
 
 # --- Flask Keep Alive ---
 from flask import Flask
@@ -81,7 +225,8 @@ bot_locked = False
 # --- Verification State ---
 # Stores user IDs that are currently verified (session-based)
 verified_users = set()
-# Persist verification in DB to survive restarts
+verification_messages = {}
+# Persist verification in Supabase to survive restarts
 VERIFIED_TABLE = 'verified_users'
 
 # --- Malware Detection Configuration ---
@@ -140,77 +285,51 @@ ADMIN_COMMAND_BUTTONS_LAYOUT_USER_SPEC = [
     ["📞 Contact Owner"]
 ]
 
-# --- Database Setup ---
+# --- Database Setup (Supabase) ---
 def init_db():
-    """Initialize the database with required tables"""
-    logger.info(f"Initializing database at: {DATABASE_PATH}")
+    """Validate Supabase configuration and ensure the configured admin IDs exist."""
     try:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        c.execute('''CREATE TABLE IF NOT EXISTS subscriptions
-                     (user_id INTEGER PRIMARY KEY, expiry TEXT)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS user_files
-                     (user_id INTEGER, file_name TEXT, file_type TEXT,
-                      PRIMARY KEY (user_id, file_name))''')
-        c.execute('''CREATE TABLE IF NOT EXISTS active_users
-                     (user_id INTEGER PRIMARY KEY)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS admins
-                     (user_id INTEGER PRIMARY KEY)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS verified_users
-                     (user_id INTEGER PRIMARY KEY, verified_at TEXT)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS hosted_scripts
-                     (user_id INTEGER, file_name TEXT, file_type TEXT,
-                      auto_restart INTEGER DEFAULT 1, last_started_at TEXT,
-                      PRIMARY KEY (user_id, file_name))''')
-        c.execute('INSERT OR IGNORE INTO admins (user_id) VALUES (?)', (OWNER_ID,))
+        if not SUPABASE_URL or not SUPABASE_SECRET_KEY:
+            raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SECRET_KEY environment variable")
+        supabase_request("POST", "admins", json_body=[{"user_id": OWNER_ID}])
         if ADMIN_ID != OWNER_ID:
-            c.execute('INSERT OR IGNORE INTO admins (user_id) VALUES (?)', (ADMIN_ID,))
-        conn.commit()
-        conn.close()
-        logger.info("Database initialized successfully.")
+            supabase_request("POST", "admins", json_body=[{"user_id": ADMIN_ID}])
+        logger.info("Supabase persistence initialized successfully.")
     except Exception as e:
-        logger.error(f"❌ Database initialization error: {e}", exc_info=True)
+        logger.error(f"❌ Supabase initialization error: {e}", exc_info=True)
+        raise
 
 def load_data():
-    """Load data from database into memory"""
-    logger.info("Loading data from database...")
+    """Load persistent data from Supabase into memory."""
+    logger.info("Loading data from Supabase...")
     try:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
+        user_subscriptions.clear(); user_files.clear(); active_users.clear(); verified_users.clear()
 
-        # Load subscriptions
-        c.execute('SELECT user_id, expiry FROM subscriptions')
-        for user_id, expiry in c.fetchall():
+        for row in supabase_request("GET", "subscriptions", params={"select": "user_id,expiry"}):
             try:
-                user_subscriptions[user_id] = {'expiry': datetime.fromisoformat(expiry)}
-            except ValueError:
-                logger.warning(f"⚠️ Invalid expiry date format for user {user_id}: {expiry}. Skipping.")
+                user_subscriptions[int(row["user_id"])] = {"expiry": datetime.fromisoformat(row["expiry"])}
+            except (ValueError, TypeError, KeyError):
+                logger.warning(f"⚠️ Invalid subscription row: {row}")
 
-        # Load user files
-        c.execute('SELECT user_id, file_name, file_type FROM user_files')
-        for user_id, file_name, file_type in c.fetchall():
-            if user_id not in user_files:
-                user_files[user_id] = []
-            user_files[user_id].append((file_name, file_type))
+        for row in supabase_request("GET", "user_files", params={"select": "user_id,file_name,file_type"}):
+            uid = int(row["user_id"])
+            user_files.setdefault(uid, []).append((row["file_name"], row.get("file_type") or "py"))
 
-        # Load active users
-        c.execute('SELECT user_id FROM active_users')
-        active_users.update(user_id for (user_id,) in c.fetchall())
+        for row in supabase_request("GET", "active_users", params={"select": "user_id"}):
+            active_users.add(int(row["user_id"]))
 
-        # Load admins
-        c.execute('SELECT user_id FROM admins')
-        admin_ids.update(user_id for (user_id,) in c.fetchall())
+        for row in supabase_request("GET", "admins", params={"select": "user_id"}):
+            admin_ids.add(int(row["user_id"]))
 
-        # Load verified users
-        c.execute('SELECT user_id FROM verified_users')
-        verified_users.update(user_id for (user_id,) in c.fetchall())
+        for row in supabase_request("GET", "verified_users", params={"select": "user_id"}):
+            verified_users.add(int(row["user_id"]))
 
-        conn.close()
         logger.info(f"Data loaded: {len(active_users)} users, {len(user_subscriptions)} subscriptions, {len(admin_ids)} admins, {len(verified_users)} verified.")
     except Exception as e:
-        logger.error(f"❌ Error loading data: {e}", exc_info=True)
+        logger.error(f"❌ Error loading data from Supabase: {e}", exc_info=True)
+        raise
 
-# Initialize DB and Load Data at startup
+# Initialize Supabase and load data at startup
 init_db()
 load_data()
 # --- End Database Setup ---
@@ -221,14 +340,9 @@ def is_user_verified(user_id):
     return user_id in verified_users
 
 def save_verified_user(user_id):
-    """Save verified user to DB and memory"""
+    """Save verified user to Supabase and memory."""
     try:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        c.execute('INSERT OR REPLACE INTO verified_users (user_id, verified_at) VALUES (?, ?)',
-                  (user_id, datetime.now().isoformat()))
-        conn.commit()
-        conn.close()
+        supabase_request("POST", "verified_users", json_body=[{"user_id": user_id, "verified_at": datetime.now().isoformat()}])
         verified_users.add(user_id)
         logger.info(f"✅ User {user_id} verified and saved.")
         return True
@@ -237,13 +351,9 @@ def save_verified_user(user_id):
         return False
 
 def remove_verified_user(user_id):
-    """Remove verified user from DB and memory"""
+    """Remove verified user from Supabase and memory."""
     try:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        c.execute('DELETE FROM verified_users WHERE user_id = ?', (user_id,))
-        conn.commit()
-        conn.close()
+        supabase_request("DELETE", "verified_users", params={"user_id": f"eq.{user_id}"})
         verified_users.discard(user_id)
         logger.info(f"🔴 User {user_id} verification removed.")
         return True
@@ -346,35 +456,17 @@ def send_verification_prompt(chat_id, user_id):
         parse_mode='Markdown'
     )
 
-    # Store message ID to avoid duplicate prompts
-    try:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        c.execute('''CREATE TABLE IF NOT EXISTS verification_messages
-                     (user_id INTEGER PRIMARY KEY, message_id INTEGER)''')
-        c.execute('INSERT OR REPLACE INTO verification_messages (user_id, message_id) VALUES (?, ?)',
-                  (user_id, msg.message_id))
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        logger.error(f"Error storing verification message ID: {e}")
+    # Store message ID in memory to avoid duplicate prompts during this process lifetime.
+    verification_messages[user_id] = msg.message_id
 
 def clear_verification_prompt(chat_id, user_id):
-    """Delete existing verification prompt to avoid clutter"""
-    try:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        c.execute('SELECT message_id FROM verification_messages WHERE user_id = ?', (user_id,))
-        result = c.fetchone()
-        conn.close()
-
-        if result:
-            try:
-                bot.delete_message(chat_id, result[0])
-            except Exception as e:
-                logger.debug(f"Could not delete verification message: {e}")
-    except Exception as e:
-        logger.error(f"Error clearing verification prompt: {e}")
+    """Delete existing verification prompt to avoid clutter."""
+    message_id = verification_messages.pop(user_id, None)
+    if message_id:
+        try:
+            bot.delete_message(chat_id, message_id)
+        except Exception as e:
+            logger.debug(f"Could not delete verification message: {e}")
 
 def process_verification(call):
     """Handle verification callback"""
@@ -988,161 +1080,106 @@ def run_js_script(script_path, script_owner_id, user_folder, file_name, message_
              kill_process_tree(bot_scripts[script_key])
              del bot_scripts[script_key]
 
-# --- Database Operations ---
+# --- Database Operations (Supabase) ---
 DB_LOCK = threading.Lock()
 
 def save_hosted_script(user_id, file_name, file_type):
-    """Persist a successfully running script for automatic restart recovery."""
-    with DB_LOCK:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        try:
-            c.execute('''INSERT OR REPLACE INTO hosted_scripts
-                         (user_id, file_name, file_type, auto_restart, last_started_at)
-                         VALUES (?, ?, ?, 1, ?)''',
-                      (user_id, file_name, file_type, datetime.now().isoformat()))
-            conn.commit()
-            logger.info(f"Persisted hosted script '{file_name}' ({file_type}) for user {user_id}.")
-        except sqlite3.Error as e:
-            logger.error(f"❌ SQLite error saving hosted script {user_id}/{file_name}: {e}")
-        finally:
-            conn.close()
+    try:
+        supabase_request("POST", "hosted_scripts", json_body=[{"user_id": user_id, "file_name": file_name, "file_type": file_type, "auto_restart": 1, "last_started_at": datetime.now().isoformat()}])
+        logger.info(f"Persisted hosted script '{file_name}' ({file_type}) for user {user_id}.")
+    except Exception as e:
+        logger.error(f"❌ Supabase error saving hosted script {user_id}/{file_name}: {e}")
 
 def remove_hosted_script(user_id, file_name):
-    """Remove a script from automatic recovery after a manual stop/delete."""
-    with DB_LOCK:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        try:
-            c.execute('DELETE FROM hosted_scripts WHERE user_id = ? AND file_name = ?', (user_id, file_name))
-            conn.commit()
-            logger.info(f"Removed hosted recovery record for {user_id}/{file_name}.")
-        except sqlite3.Error as e:
-            logger.error(f"❌ SQLite error removing hosted script {user_id}/{file_name}: {e}")
-        finally:
-            conn.close()
+    try:
+        supabase_request("DELETE", "hosted_scripts", params={"user_id": f"eq.{user_id}", "file_name": f"eq.{file_name}"})
+        logger.info(f"Removed hosted recovery record for {user_id}/{file_name}.")
+    except Exception as e:
+        logger.error(f"❌ Supabase error removing hosted script {user_id}/{file_name}: {e}")
 
 def get_hosted_scripts_to_recover():
-    """Load scripts that should be restored after an XHOST restart."""
-    with DB_LOCK:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        try:
-            c.execute('SELECT user_id, file_name, file_type FROM hosted_scripts WHERE auto_restart = 1')
-            return c.fetchall()
-        except sqlite3.Error as e:
-            logger.error(f"❌ SQLite error loading hosted recovery records: {e}")
-            return []
-        finally:
-            conn.close()
+    try:
+        rows = supabase_request("GET", "hosted_scripts", params={"select": "user_id,file_name,file_type", "auto_restart": "eq.1"})
+        return [(int(r["user_id"]), r["file_name"], r.get("file_type") or "py") for r in rows]
+    except Exception as e:
+        logger.error(f"❌ Supabase error loading hosted recovery records: {e}")
+        return []
 
 def save_user_file(user_id, file_name, file_type='py'):
-    with DB_LOCK:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        try:
-            c.execute('INSERT OR REPLACE INTO user_files (user_id, file_name, file_type) VALUES (?, ?, ?)',
-                      (user_id, file_name, file_type))
-            conn.commit()
-            if user_id not in user_files: user_files[user_id] = []
-            user_files[user_id] = [(fn, ft) for fn, ft in user_files[user_id] if fn != file_name]
-            user_files[user_id].append((file_name, file_type))
-            logger.info(f"Saved file '{file_name}' ({file_type}) for user {user_id}")
-        except sqlite3.Error as e: logger.error(f"❌ SQLite error saving file for user {user_id}, {file_name}: {e}")
-        except Exception as e: logger.error(f"❌ Unexpected error saving file for {user_id}, {file_name}: {e}", exc_info=True)
-        finally: conn.close()
+    try:
+        supabase_request("POST", "user_files", json_body=[{"user_id": user_id, "file_name": file_name, "file_type": file_type}])
+        if user_id not in user_files: user_files[user_id] = []
+        user_files[user_id] = [(fn, ft) for fn, ft in user_files[user_id] if fn != file_name]
+        user_files[user_id].append((file_name, file_type))
+        logger.info(f"Saved file '{file_name}' ({file_type}) for user {user_id}")
+    except Exception as e:
+        logger.error(f"❌ Supabase error saving file for {user_id}/{file_name}: {e}")
+        raise
 
 def remove_user_file_db(user_id, file_name):
-    with DB_LOCK:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        try:
-            c.execute('DELETE FROM user_files WHERE user_id = ? AND file_name = ?', (user_id, file_name))
-            conn.commit()
-            if user_id in user_files:
-                user_files[user_id] = [f for f in user_files[user_id] if f[0] != file_name]
-                if not user_files[user_id]: del user_files[user_id]
-            logger.info(f"Removed file '{file_name}' for user {user_id} from DB")
-        except sqlite3.Error as e: logger.error(f"❌ SQLite error removing file for {user_id}, {file_name}: {e}")
-        except Exception as e: logger.error(f"❌ Unexpected error removing file for {user_id}, {file_name}: {e}", exc_info=True)
-        finally: conn.close()
+    try:
+        supabase_request("DELETE", "user_files", params={"user_id": f"eq.{user_id}", "file_name": f"eq.{file_name}"})
+        if user_id in user_files:
+            user_files[user_id] = [f for f in user_files[user_id] if f[0] != file_name]
+            if not user_files[user_id]: del user_files[user_id]
+        logger.info(f"Removed file '{file_name}' for user {user_id} from DB")
+    except Exception as e:
+        logger.error(f"❌ Supabase error removing file for {user_id}/{file_name}: {e}")
+        raise
 
 def add_active_user(user_id):
-    active_users.add(user_id) 
-    with DB_LOCK:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        try:
-            c.execute('INSERT OR IGNORE INTO active_users (user_id) VALUES (?)', (user_id,))
-            conn.commit()
-            logger.info(f"Added/Confirmed active user {user_id} in DB")
-        except sqlite3.Error as e: logger.error(f"❌ SQLite error adding active user {user_id}: {e}")
-        except Exception as e: logger.error(f"❌ Unexpected error adding active user {user_id}: {e}", exc_info=True)
-        finally: conn.close()
+    active_users.add(user_id)
+    try:
+        supabase_request("POST", "active_users", json_body=[{"user_id": user_id}])
+        logger.info(f"Added/Confirmed active user {user_id} in Supabase")
+    except Exception as e:
+        logger.error(f"❌ Supabase error adding active user {user_id}: {e}")
 
 def save_subscription(user_id, expiry):
-    with DB_LOCK:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        try:
-            expiry_str = expiry.isoformat()
-            c.execute('INSERT OR REPLACE INTO subscriptions (user_id, expiry) VALUES (?, ?)', (user_id, expiry_str))
-            conn.commit()
-            user_subscriptions[user_id] = {'expiry': expiry}
-            logger.info(f"Saved subscription for {user_id}, expiry {expiry_str}")
-        except sqlite3.Error as e: logger.error(f"❌ SQLite error saving subscription for {user_id}: {e}")
-        except Exception as e: logger.error(f"❌ Unexpected error saving subscription for {user_id}: {e}", exc_info=True)
-        finally: conn.close()
+    try:
+        expiry_str = expiry.isoformat()
+        supabase_request("POST", "subscriptions", json_body=[{"user_id": user_id, "expiry": expiry_str}])
+        user_subscriptions[user_id] = {'expiry': expiry}
+        logger.info(f"Saved subscription for {user_id}, expiry {expiry_str}")
+    except Exception as e:
+        logger.error(f"❌ Supabase error saving subscription for {user_id}: {e}")
+        raise
 
 def remove_subscription_db(user_id):
-    with DB_LOCK:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        try:
-            c.execute('DELETE FROM subscriptions WHERE user_id = ?', (user_id,))
-            conn.commit()
-            if user_id in user_subscriptions: del user_subscriptions[user_id]
-            logger.info(f"Removed subscription for {user_id} from DB")
-        except sqlite3.Error as e: logger.error(f"❌ SQLite error removing subscription for {user_id}: {e}")
-        except Exception as e: logger.error(f"❌ Unexpected error removing subscription for {user_id}: {e}", exc_info=True)
-        finally: conn.close()
+    try:
+        supabase_request("DELETE", "subscriptions", params={"user_id": f"eq.{user_id}"})
+        user_subscriptions.pop(user_id, None)
+        logger.info(f"Removed subscription for {user_id} from DB")
+    except Exception as e:
+        logger.error(f"❌ Supabase error removing subscription for {user_id}: {e}")
+        raise
 
 def add_admin_db(admin_id):
-    with DB_LOCK:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        try:
-            c.execute('INSERT OR IGNORE INTO admins (user_id) VALUES (?)', (admin_id,))
-            conn.commit()
-            admin_ids.add(admin_id) 
-            logger.info(f"Added admin {admin_id} to DB")
-        except sqlite3.Error as e: logger.error(f"❌ SQLite error adding admin {admin_id}: {e}")
-        except Exception as e: logger.error(f"❌ Unexpected error adding admin {admin_id}: {e}", exc_info=True)
-        finally: conn.close()
+    try:
+        supabase_request("POST", "admins", json_body=[{"user_id": admin_id}])
+        admin_ids.add(admin_id)
+        logger.info(f"Added admin {admin_id} to Supabase")
+    except Exception as e:
+        logger.error(f"❌ Supabase error adding admin {admin_id}: {e}")
+        raise
 
 def remove_admin_db(admin_id):
     if admin_id == OWNER_ID:
         logger.warning("Attempted to remove OWNER_ID from admins.")
-        return False 
-    with DB_LOCK:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        removed = False
-        try:
-            c.execute('SELECT 1 FROM admins WHERE user_id = ?', (admin_id,))
-            if c.fetchone():
-                c.execute('DELETE FROM admins WHERE user_id = ?', (admin_id,))
-                conn.commit()
-                removed = c.rowcount > 0 
-                if removed: admin_ids.discard(admin_id); logger.info(f"Removed admin {admin_id} from DB")
-                else: logger.warning(f"Admin {admin_id} found but delete affected 0 rows.")
-            else:
-                logger.warning(f"Admin {admin_id} not found in DB.")
-                admin_ids.discard(admin_id)
-            return removed
-        except sqlite3.Error as e: logger.error(f"❌ SQLite error removing admin {admin_id}: {e}"); return False
-        except Exception as e: logger.error(f"❌ Unexpected error removing admin {admin_id}: {e}", exc_info=True); return False
-        finally: conn.close()
+        return False
+    try:
+        rows = supabase_request("GET", "admins", params={"select": "user_id", "user_id": f"eq.{admin_id}"})
+        if rows:
+            supabase_request("DELETE", "admins", params={"user_id": f"eq.{admin_id}"})
+            admin_ids.discard(admin_id)
+            logger.info(f"Removed admin {admin_id} from Supabase")
+            return True
+        admin_ids.discard(admin_id)
+        logger.warning(f"Admin {admin_id} not found in Supabase.")
+        return False
+    except Exception as e:
+        logger.error(f"❌ Supabase error removing admin {admin_id}: {e}")
+        return False
 # --- End Database Operations ---
 
 # --- Menu creation (Inline and ReplyKeyboards) ---
@@ -1372,6 +1409,7 @@ def handle_zip_file(downloaded_file_content, file_name_zip, message):
             elif os.path.exists(dest_path): os.remove(dest_path)
             shutil.move(src_path, dest_path); moved_count +=1
         logger.info(f"Moved {moved_count} items to {user_folder}")
+        sync_user_folder_to_supabase(user_id, user_folder)
 
         save_user_file(user_id, main_script_name, file_type)
         logger.info(f"Saved main script '{main_script_name}' ({file_type}) for {user_id} from zip.")
@@ -1948,6 +1986,7 @@ def handle_file_upload_doc(message):
             file_path = os.path.join(user_folder, file_name)
             with open(file_path, 'wb') as f: f.write(downloaded_file_content)
             logger.info(f"Saved single file to {file_path}")
+            sync_single_file_to_supabase(user_id, file_path, user_folder)
             if file_ext == '.js': handle_js_file(file_path, user_id, user_folder, file_name, message)
             elif file_ext == '.py': handle_py_file(file_path, user_id, user_folder, file_name, message)
     except telebot.apihelper.ApiTelegramException as e:
@@ -2393,6 +2432,12 @@ def delete_bot_callback(call):
             try: os.remove(log_path); deleted_disk.append(os.path.basename(log_path)); logger.info(f"Deleted log: {log_path}")
             except OSError as e: logger.error(f"Error deleting log {log_path}: {e}")
 
+        # Remove the main file and its log from persistent storage too.
+        try:
+            supabase_storage_delete(script_owner_id, file_name)
+            supabase_storage_delete(script_owner_id, f"{os.path.splitext(file_name)[0]}.log")
+        except Exception as e:
+            logger.warning(f"Could not remove persistent storage object for {file_name}: {e}")
         remove_hosted_script(script_owner_id, file_name)
         remove_user_file_db(script_owner_id, file_name)
         deleted_str = ", ".join(f"`{f}`" for f in deleted_disk) if deleted_disk else "associated files"
@@ -2825,7 +2870,7 @@ def process_check_subscription_id(message):
 
 # --- Persistent Hosting Recovery ---
 def recover_hosted_scripts():
-    """Restore scripts that were running before XHOST BOT restarted."""
+    """Restore persistent user files from Supabase Storage, then restart hosted scripts."""
     records = get_hosted_scripts_to_recover()
     if not records:
         logger.info("No persisted hosted scripts to recover.")
@@ -2834,22 +2879,33 @@ def recover_hosted_scripts():
     logger.warning(f"🔄 Recovering {len(records)} persisted hosted script(s) after restart...")
     recovered = 0
     skipped = 0
+    restored_users = set()
+
     for user_id, file_name, file_type in records:
-        user_folder = get_user_folder(user_id)
-        file_path = os.path.join(user_folder, file_name)
-        script_key = f"{user_id}_{file_name}"
-
-        if not os.path.exists(file_path):
-            logger.warning(f"[HOST RECOVERY] Missing file for {script_key}; removing stale recovery record.")
-            remove_hosted_script(user_id, file_name)
-            skipped += 1
-            continue
-
-        if is_bot_running(user_id, file_name):
-            logger.info(f"[HOST RECOVERY] {script_key} is already running; skipping.")
-            continue
-
         try:
+            user_folder = get_user_folder(user_id)
+            if user_id not in restored_users:
+                restore_user_folder_from_supabase(user_id, user_folder)
+                # Recreate local Node dependencies after a Render restart.
+                if os.path.exists(os.path.join(user_folder, "package.json")) and os.path.isdir(os.path.join(user_folder, "node_modules")) is False:
+                    try:
+                        subprocess.run(["npm", "install"], cwd=user_folder, capture_output=True, text=True, check=False, timeout=300)
+                    except Exception as dep_e:
+                        logger.warning(f"[HOST RECOVERY] npm install failed for user {user_id}: {dep_e}")
+                restored_users.add(user_id)
+
+            file_path = os.path.join(user_folder, file_name)
+            script_key = f"{user_id}_{file_name}"
+            if not os.path.exists(file_path):
+                logger.warning(f"[HOST RECOVERY] Missing file for {script_key} in Supabase Storage; removing stale recovery record.")
+                remove_hosted_script(user_id, file_name)
+                skipped += 1
+                continue
+
+            if is_bot_running(user_id, file_name):
+                logger.info(f"[HOST RECOVERY] {script_key} is already running; skipping.")
+                continue
+
             if file_type == 'py':
                 threading.Thread(target=run_script, args=(file_path, user_id, user_folder, file_name, None), daemon=True).start()
             elif file_type == 'js':
@@ -2861,7 +2917,7 @@ def recover_hosted_scripts():
             recovered += 1
             time.sleep(0.5)
         except Exception as e:
-            logger.error(f"[HOST RECOVERY] Failed to queue {script_key}: {e}", exc_info=True)
+            logger.error(f"[HOST RECOVERY] Failed to recover {user_id}/{file_name}: {e}", exc_info=True)
             skipped += 1
 
     logger.warning(f"🔄 Host recovery queued: {recovered}; skipped: {skipped}.")
