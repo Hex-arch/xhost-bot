@@ -18,6 +18,9 @@ import re
 import sys
 import atexit
 import requests
+import socket
+import secrets
+from urllib.parse import urljoin
 
 # --- Flask Keep Alive ---
 from flask import Flask
@@ -41,7 +44,9 @@ def keep_alive():
 # --- End Flask Keep Alive ---
 
 # --- Configuration ---
-TOKEN = '7561447303:AAFCTEYQiIzDTE_LymMf7fxeOp7r6K8Jsv4'
+TOKEN = os.environ.get('BOT_TOKEN', '')
+if not TOKEN:
+    raise RuntimeError('BOT_TOKEN environment variable is required.')
 OWNER_ID = 7305141058
 ADMIN_ID = 7305141058
 YOUR_USERNAME = '@X1n0q'
@@ -71,6 +76,16 @@ active_users = set()
 admin_ids = {ADMIN_ID, OWNER_ID}
 bot_locked = False
 verified_users = set()
+# Web-app registry: token -> running uploaded web application.
+web_apps = {}
+WEB_PORT_MIN = int(os.environ.get('WEB_PORT_MIN', '10000'))
+WEB_PORT_MAX = int(os.environ.get('WEB_PORT_MAX', '20000'))
+PUBLIC_BASE_URL = (os.environ.get('PUBLIC_BASE_URL') or
+                   os.environ.get('RENDER_EXTERNAL_URL') or
+                   os.environ.get('RENDER_EXTERNAL_HOSTNAME'))
+if PUBLIC_BASE_URL and not PUBLIC_BASE_URL.startswith(('http://', 'https://')):
+    PUBLIC_BASE_URL = 'https://' + PUBLIC_BASE_URL
+PUBLIC_BASE_URL = PUBLIC_BASE_URL.rstrip('/') if PUBLIC_BASE_URL else None
 VERIFIED_TABLE = 'verified_users'
 
 # --- Logging ---
@@ -454,6 +469,116 @@ def attempt_install_npm(module_name, user_folder, message):
         bot.reply_to(message, f"❌ Error installing Node package: {e}")
         return False
 
+def is_web_app_script(script_path):
+    """Best-effort detection for uploaded Flask/Flask-SocketIO apps."""
+    try:
+        with open(script_path, 'r', encoding='utf-8', errors='ignore') as f:
+            source = f.read(30000)
+        return bool(re.search(r"(?:from|import)\s+flask(?:_socketio)?|Flask\s*\(", source))
+    except Exception:
+        return False
+
+def allocate_web_port():
+    """Find an unused local TCP port for an uploaded web app."""
+    used = {info.get('port') for info in web_apps.values() if info.get('port')}
+    for port in range(WEB_PORT_MIN, WEB_PORT_MAX + 1):
+        if port in used:
+            continue
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(('127.0.0.1', port))
+            return port
+        except OSError:
+            continue
+        finally:
+            sock.close()
+    raise RuntimeError('No free web-app ports available.')
+
+def register_web_app(script_key, script_owner_id, file_name, port):
+    token = secrets.token_urlsafe(18)
+    web_apps[token] = {
+        'script_key': script_key,
+        'script_owner_id': script_owner_id,
+        'file_name': file_name,
+        'port': port,
+    }
+    return token
+
+def unregister_web_app(script_key):
+    for token, info in list(web_apps.items()):
+        if info.get('script_key') == script_key:
+            web_apps.pop(token, None)
+
+def get_web_app_url(script_key):
+    if not PUBLIC_BASE_URL:
+        return None
+    for token, info in web_apps.items():
+        if info.get('script_key') == script_key:
+            return f"{PUBLIC_BASE_URL}/web/{token}/"
+    return None
+
+def create_web_proxy_routes():
+    """Proxy HTTP requests to registered local web apps.
+
+    This supports normal HTTP routes and Socket.IO polling. Browser websocket
+    upgrades still require a websocket-capable front proxy.
+    """
+    @app.route('/web/<token>/', defaults={'subpath': ''}, methods=['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'])
+    @app.route('/web/<token>/<path:subpath>', methods=['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'])
+    def web_app_proxy(token, subpath):
+        info = web_apps.get(token)
+        if not info:
+            return 'Web app not found or no longer running.', 404
+        process_info = bot_scripts.get(info['script_key'])
+        if not process_info or not process_info.get('process') or process_info['process'].poll() is not None:
+            unregister_web_app(info['script_key'])
+            return 'Web app is not running.', 404
+
+        target = f"http://127.0.0.1:{info['port']}/"
+        if subpath:
+            target = urljoin(target, subpath)
+        try:
+            response = requests.request(
+                request.method, target,
+                params=request.args,
+                data=request.get_data(),
+                headers={k: v for k, v in request.headers if k.lower() not in {'host', 'content-length'}},
+                cookies=request.cookies,
+                allow_redirects=False,
+                timeout=60
+            )
+        except requests.RequestException as e:
+            logger.warning(f"Web proxy error for {info['script_key']}: {e}")
+            return 'Web app is not responding.', 502
+
+        from flask import Response
+        body = response.content
+        content_type = response.headers.get('Content-Type', '')
+        if 'text/html' in content_type:
+            try:
+                html = body.decode(response.encoding or 'utf-8', errors='ignore')
+                prefix = f"/web/{token}/"
+                html = html.replace('href="/static/', f'href="{prefix}static/')
+                html = html.replace("href='/static/", f"href='{prefix}static/")
+                html = html.replace('src="/static/', f'src="{prefix}static/')
+                html = html.replace("src='/static/", f"src='{prefix}static/")
+                html = html.replace("fetch('/api/", f"fetch('{prefix}api/")
+                html = html.replace('fetch("/api/', f'fetch("{prefix}api/')
+                html = html.replace("window.location.href = '/api/", f"window.location.href = '{prefix}api/")
+                # Force Socket.IO to use HTTP polling through this Flask proxy.
+                html = html.replace("transports: ['websocket', 'polling']", "transports: ['polling']")
+                html = html.replace('const socket = io({', f"const socket = io({{ path: '{prefix}socket.io',")
+                body = html.encode('utf-8')
+            except Exception:
+                pass
+
+        excluded = {'content-encoding', 'content-length', 'transfer-encoding', 'connection'}
+        out_headers = [(k, v) for k, v in response.headers.items() if k.lower() not in excluded]
+        return Response(body, status=response.status_code, headers=out_headers)
+
+create_web_proxy_routes()
+
 def run_script(script_path, script_owner_id, user_folder, file_name, message_obj_for_reply, attempt=1):
     max_attempts = 2
     if attempt > max_attempts:
@@ -462,6 +587,15 @@ def run_script(script_path, script_owner_id, user_folder, file_name, message_obj
 
     script_key = f"{script_owner_id}_{file_name}"
     logger.info(f"Attempt {attempt} to run: {script_path} (Key: {script_key})")
+    web_app = is_web_app_script(script_path)
+    web_port = None
+    web_token = None
+    if web_app:
+        try:
+            web_port = allocate_web_port()
+        except Exception as e:
+            bot.reply_to(message_obj_for_reply, f"❌ Could not allocate a web port: {e}")
+            return
 
     try:
         if not os.path.exists(script_path):
@@ -474,7 +608,11 @@ def run_script(script_path, script_owner_id, user_folder, file_name, message_obj
         if attempt == 1:
             check_proc = None
             try:
-                check_proc = subprocess.Popen([sys.executable, script_path], cwd=user_folder,
+                env = os.environ.copy()
+                if web_app and web_port:
+                    env['PORT'] = str(web_port)
+                    env['HOST'] = '0.0.0.0'
+                check_proc = subprocess.Popen([sys.executable, script_path], cwd=user_folder, env=env,
                                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                               text=True, encoding='utf-8', errors='ignore')
                 stdout, stderr = check_proc.communicate(timeout=5)
@@ -521,8 +659,12 @@ def run_script(script_path, script_owner_id, user_folder, file_name, message_obj
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
                 startupinfo.wShowWindow = subprocess.SW_HIDE
+            env = os.environ.copy()
+            if web_app and web_port:
+                env['PORT'] = str(web_port)
+                env['HOST'] = '0.0.0.0'
             process = subprocess.Popen(
-                [sys.executable, script_path], cwd=user_folder,
+                [sys.executable, script_path], cwd=user_folder, env=env,
                 stdout=log_file, stderr=log_file, stdin=subprocess.PIPE,
                 startupinfo=startupinfo, creationflags=creationflags,
                 encoding='utf-8', errors='ignore'
@@ -532,9 +674,22 @@ def run_script(script_path, script_owner_id, user_folder, file_name, message_obj
                 'chat_id': message_obj_for_reply.chat.id if message_obj_for_reply else OWNER_ID,
                 'script_owner_id': script_owner_id,
                 'start_time': datetime.now(), 'user_folder': user_folder,
-                'type': 'py', 'script_key': script_key
+                'type': 'py', 'script_key': script_key,
+                'web_app': web_app, 'web_port': web_port, 'web_token': None
             }
-            bot.reply_to(message_obj_for_reply, f"✅ Python script '{file_name}' started! (PID: {process.pid})")
+            if web_app and web_port:
+                web_token = register_web_app(script_key, script_owner_id, file_name, web_port)
+                bot_scripts[script_key]['web_token'] = web_token
+            if web_app:
+                web_url = get_web_app_url(script_key)
+                if web_url:
+                    markup = types.InlineKeyboardMarkup()
+                    markup.add(types.InlineKeyboardButton('🌐 Open Web App', url=web_url))
+                    bot.reply_to(message_obj_for_reply, f"✅ Web app '{file_name}' started! (PID: {process.pid})\n\n🌐 Click the button below to open it.", reply_markup=markup)
+                else:
+                    bot.reply_to(message_obj_for_reply, f"✅ Web app '{file_name}' started! (PID: {process.pid})\n⚠️ Set PUBLIC_BASE_URL in your hosting environment to enable the Open Web App button.")
+            else:
+                bot.reply_to(message_obj_for_reply, f"✅ Python script '{file_name}' started! (PID: {process.pid})")
         except FileNotFoundError:
             bot.reply_to(message_obj_for_reply, f"❌ Python interpreter not found.")
             if log_file and not log_file.closed: log_file.close()
@@ -806,7 +961,12 @@ def create_reply_keyboard_main_menu(user_id):
 
 def create_control_buttons(script_owner_id, file_name, is_running=True):
     markup = types.InlineKeyboardMarkup(row_width=2)
+    script_key = f"{script_owner_id}_{file_name}"
+    script_info = bot_scripts.get(script_key, {})
+    web_url = get_web_app_url(script_key) if script_info.get('web_app') else None
     if is_running:
+        if web_url:
+            markup.add(types.InlineKeyboardButton('🌐 Open Web App', url=web_url))
         markup.row(
             types.InlineKeyboardButton("🔴 Stop", callback_data=f'stop_{script_owner_id}_{file_name}'),
             types.InlineKeyboardButton("🔄 Restart", callback_data=f'restart_{script_owner_id}_{file_name}')
@@ -1709,6 +1869,7 @@ def stop_bot_callback(call):
         process_info = bot_scripts.get(script_key)
         if process_info:
             kill_process_tree(process_info)
+            unregister_web_app(script_key)
             if script_key in bot_scripts: del bot_scripts[script_key]
         try:
             bot.edit_message_text(
@@ -1747,6 +1908,7 @@ def restart_bot_callback(call):
         if is_bot_running(script_owner_id, file_name):
             process_info = bot_scripts.get(script_key)
             if process_info: kill_process_tree(process_info)
+            unregister_web_app(script_key)
             if script_key in bot_scripts: del bot_scripts[script_key]
             time.sleep(1.5)
         if file_type == 'py':
@@ -1784,6 +1946,7 @@ def delete_bot_callback(call):
         if is_bot_running(script_owner_id, file_name):
             process_info = bot_scripts.get(script_key)
             if process_info: kill_process_tree(process_info)
+            unregister_web_app(script_key)
             if script_key in bot_scripts: del bot_scripts[script_key]
             time.sleep(0.5)
         user_folder = get_user_folder(script_owner_id)
@@ -2204,6 +2367,7 @@ def cleanup():
     for key in script_keys_to_stop:
         if key in bot_scripts:
             kill_process_tree(bot_scripts[key])
+            unregister_web_app(key)
 atexit.register(cleanup)
 
 # --- Main ---
