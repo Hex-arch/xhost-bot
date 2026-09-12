@@ -23,7 +23,7 @@ import secrets
 from urllib.parse import urljoin
 
 # --- Flask Keep Alive ---
-from flask import Flask
+from flask import Flask, request, Response
 from threading import Thread
 
 app = Flask('')
@@ -552,7 +552,6 @@ def create_web_proxy_routes():
             logger.warning(f"Web proxy error for {info['script_key']}: {e}")
             return 'Web app is not responding.', 502
 
-        from flask import Response
         body = response.content
         content_type = response.headers.get('Content-Type', '')
         if 'text/html' in content_type:
@@ -612,7 +611,7 @@ def run_script(script_path, script_owner_id, user_folder, file_name, message_obj
                 if web_app and web_port:
                     env['PORT'] = str(web_port)
                     env['HOST'] = '0.0.0.0'
-                check_proc = subprocess.Popen([sys.executable, script_path], cwd=user_folder, env=env,
+                check_proc = subprocess.Popen([get_script_python(script_path, user_folder), script_path], cwd=user_folder, env=env,
                                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                               text=True, encoding='utf-8', errors='ignore')
                 stdout, stderr = check_proc.communicate(timeout=5)
@@ -664,7 +663,7 @@ def run_script(script_path, script_owner_id, user_folder, file_name, message_obj
                 env['PORT'] = str(web_port)
                 env['HOST'] = '0.0.0.0'
             process = subprocess.Popen(
-                [sys.executable, script_path], cwd=user_folder, env=env,
+                [get_script_python(script_path, user_folder), script_path], cwd=user_folder, env=env,
                 stdout=log_file, stderr=log_file, stdin=subprocess.PIPE,
                 startupinfo=startupinfo, creationflags=creationflags,
                 encoding='utf-8', errors='ignore'
@@ -1016,6 +1015,74 @@ def create_send_command_menu():
     return markup
 # --- End Menu Creation ---
 
+# --- Isolated app environment helpers ---
+def get_app_python(user_folder):
+    """Return the per-upload virtualenv Python if it exists, otherwise host Python."""
+    if os.name == 'nt':
+        candidate = os.path.join(user_folder, '.venv', 'Scripts', 'python.exe')
+    else:
+        candidate = os.path.join(user_folder, '.venv', 'bin', 'python')
+    return candidate if os.path.exists(candidate) else sys.executable
+
+
+def install_requirements_isolated(user_folder, req_path, message):
+    """Install an uploaded app's requirements into its own venv with a hard timeout."""
+    import venv
+    venv_dir = os.path.join(user_folder, '.venv')
+    try:
+        if not os.path.exists(venv_dir):
+            bot.reply_to(message, "🧪 Creating isolated Python environment...")
+            venv.EnvBuilder(with_pip=True, clear=False, symlinks=False).create(venv_dir)
+        app_python = get_app_python(user_folder)
+        if app_python == sys.executable:
+            raise RuntimeError("Could not create the app virtual environment.")
+
+        bot.reply_to(message, "🔄 Installing Python deps in the app environment...")
+        command = [app_python, '-m', 'pip', 'install', '--disable-pip-version-check',
+                   '--prefer-binary', '-r', req_path]
+        logger.info("Installing app requirements: %s", ' '.join(command))
+        proc = subprocess.Popen(command, cwd=user_folder, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, encoding='utf-8',
+                                errors='ignore', bufsize=1)
+        output = []
+        started = time.time()
+        while True:
+            line = proc.stdout.readline() if proc.stdout else ''
+            if line:
+                line = line.rstrip()
+                output.append(line)
+                logger.info("[app pip] %s", line)
+            elif proc.poll() is not None:
+                break
+            elif time.time() - started > 300:
+                proc.kill()
+                proc.wait(timeout=5)
+                raise TimeoutError("Dependency installation timed out after 5 minutes.")
+            else:
+                time.sleep(0.1)
+        rc = proc.returncode
+        if rc != 0:
+            tail = '\n'.join(output[-25:])
+            raise RuntimeError(tail or f"pip exited with code {rc}")
+        bot.reply_to(message, "✅ Python deps installed.")
+        return app_python
+    except Exception as e:
+        logger.error("Isolated dependency installation failed", exc_info=True)
+        err = str(e)
+        if len(err) > 3500:
+            err = err[-3500:]
+        bot.reply_to(message, f"❌ Python dependency installation failed:\n```\n{err}\n```",
+                     parse_mode='Markdown')
+        return None
+
+
+def get_script_python(script_path, user_folder):
+    """Use the uploaded app venv when available."""
+    app_python = get_app_python(user_folder)
+    if app_python != sys.executable:
+        return app_python
+    return sys.executable
+
 # --- File Handling (NO security scanning) ---
 def handle_zip_file(downloaded_file_content, file_name_zip, message):
     user_id = message.from_user.id
@@ -1028,11 +1095,15 @@ def handle_zip_file(downloaded_file_content, file_name_zip, message):
             new_file.write(downloaded_file_content)
 
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            # Reject unsafe archive paths before extraction.
+            for member in zip_ref.infolist():
+                target = os.path.abspath(os.path.join(temp_dir, member.filename))
+                if not target.startswith(os.path.abspath(temp_dir) + os.sep):
+                    raise ValueError(f"Unsafe ZIP path: {member.filename}")
             zip_ref.extractall(temp_dir)
 
         target_dir = temp_dir
         root_files = os.listdir(target_dir)
-
         if not any(f.endswith(('.py', '.js')) for f in root_files):
             for root, dirs, files in os.walk(temp_dir):
                 dirs[:] = [d for d in dirs if not d.startswith('.') and not d.startswith('__')]
@@ -1042,6 +1113,8 @@ def handle_zip_file(downloaded_file_content, file_name_zip, message):
 
         if target_dir != temp_dir:
             for item in os.listdir(target_dir):
+                if item == file_name_zip:
+                    continue
                 s = os.path.join(target_dir, item)
                 d = os.path.join(temp_dir, item)
                 if os.path.exists(d):
@@ -1057,60 +1130,64 @@ def handle_zip_file(downloaded_file_content, file_name_zip, message):
         req_file = 'requirements.txt' if 'requirements.txt' in extracted_items else None
         pkg_json = 'package.json' if 'package.json' in extracted_items else None
 
-        if req_file:
-            req_path = os.path.join(temp_dir, req_file)
-            bot.reply_to(message, f"🔄 Installing Python deps...")
-            try:
-                result = subprocess.run([sys.executable, '-m', 'pip', 'install', '-r', req_path],
-                                        capture_output=True, text=True, check=True,
-                                        encoding='utf-8', errors='ignore')
-                bot.reply_to(message, f"✅ Python deps installed.")
-            except subprocess.CalledProcessError as e:
-                err = f"❌ pip install failed:\n```\n{e.stderr or e.stdout}\n```"
-                if len(err) > 4000: err = err[:4000]
-                bot.reply_to(message, err, parse_mode='Markdown'); return
-            except Exception as e:
-                bot.reply_to(message, f"❌ {e}"); return
-
-        if pkg_json:
-            bot.reply_to(message, f"🔄 Installing Node deps...")
-            try:
-                result = subprocess.run(['npm', 'install'], capture_output=True, text=True,
-                                        check=True, cwd=temp_dir, encoding='utf-8', errors='ignore')
-                bot.reply_to(message, f"✅ Node deps installed.")
-            except FileNotFoundError:
-                bot.reply_to(message, "❌ 'npm' not found."); return
-            except subprocess.CalledProcessError as e:
-                err = f"❌ npm install failed:\n```\n{e.stderr or e.stdout}\n```"
-                if len(err) > 4000: err = err[:4000]
-                bot.reply_to(message, err, parse_mode='Markdown'); return
-            except Exception as e:
-                bot.reply_to(message, f"❌ {e}"); return
-
         main_script_name = None
         file_type = None
         preferred_py = ['main.py', 'bot.py', 'app.py']
         preferred_js = ['index.js', 'main.js', 'bot.js', 'app.js']
-        for p in preferred_py:
-            if p in py_files:
-                main_script_name = p; file_type = 'py'; break
+        for preferred in preferred_py:
+            if preferred in py_files:
+                main_script_name, file_type = preferred, 'py'
+                break
         if not main_script_name:
-            for p in preferred_js:
-                if p in js_files:
-                    main_script_name = p; file_type = 'js'; break
+            for preferred in preferred_js:
+                if preferred in js_files:
+                    main_script_name, file_type = preferred, 'js'
+                    break
         if not main_script_name:
-            if py_files: main_script_name = py_files[0]; file_type = 'py'
-            elif js_files: main_script_name = js_files[0]; file_type = 'js'
+            if py_files:
+                main_script_name, file_type = py_files[0], 'py'
+            elif js_files:
+                main_script_name, file_type = js_files[0], 'js'
         if not main_script_name:
-            bot.reply_to(message, "❌ No `.py` or `.js` script found in archive!"); return
+            bot.reply_to(message, "❌ No `.py` or `.js` script found in archive!")
+            return
 
+        # Move the actual application into its permanent user directory first.
         for item_name in os.listdir(temp_dir):
-            if item_name == file_name_zip: continue
+            if item_name == file_name_zip:
+                continue
             src_path = os.path.join(temp_dir, item_name)
             dest_path = os.path.join(user_folder, item_name)
-            if os.path.isdir(dest_path): shutil.rmtree(dest_path)
-            elif os.path.exists(dest_path): os.remove(dest_path)
+            if os.path.isdir(dest_path):
+                shutil.rmtree(dest_path)
+            elif os.path.exists(dest_path):
+                os.remove(dest_path)
             shutil.move(src_path, dest_path)
+
+        # Install Python dependencies in an isolated venv instead of XHOST's global Python.
+        if req_file and file_type == 'py':
+            req_path = os.path.join(user_folder, req_file)
+            if install_requirements_isolated(user_folder, req_path, message) is None:
+                return
+
+        if pkg_json:
+            bot.reply_to(message, "🔄 Installing Node deps...")
+            try:
+                result = subprocess.run(['npm', 'install'], capture_output=True, text=True,
+                                        check=True, cwd=user_folder, encoding='utf-8', errors='ignore',
+                                        timeout=300)
+                bot.reply_to(message, "✅ Node deps installed.")
+            except FileNotFoundError:
+                bot.reply_to(message, "❌ `npm` not found.")
+                return
+            except subprocess.TimeoutExpired:
+                bot.reply_to(message, "❌ npm install timed out after 5 minutes.")
+                return
+            except subprocess.CalledProcessError as e:
+                err = e.stderr or e.stdout or 'Unknown npm error'
+                if len(err) > 3500: err = err[-3500:]
+                bot.reply_to(message, f"❌ npm install failed:\n```\n{err}\n```", parse_mode='Markdown')
+                return
 
         save_user_file(user_id, main_script_name, file_type)
         main_script_path = os.path.join(user_folder, main_script_name)
@@ -1118,12 +1195,13 @@ def handle_zip_file(downloaded_file_content, file_name_zip, message):
 
         if file_type == 'py':
             threading.Thread(target=run_script, args=(main_script_path, user_id, user_folder, main_script_name, message)).start()
-        elif file_type == 'js':
+        else:
             threading.Thread(target=run_js_script, args=(main_script_path, user_id, user_folder, main_script_name, message)).start()
 
     except zipfile.BadZipFile as e:
         bot.reply_to(message, f"❌ Invalid ZIP: {e}")
     except Exception as e:
+        logger.error("Error processing ZIP", exc_info=True)
         bot.reply_to(message, f"❌ Error processing zip: {e}")
     finally:
         if temp_dir and os.path.exists(temp_dir):
