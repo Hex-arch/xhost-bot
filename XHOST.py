@@ -30,7 +30,17 @@ app = Flask('')
 
 @app.route('/')
 def home():
-    return "I'am Marco File Host"
+    return Response(
+        """<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>XHOST</title>
+<style>
+body{margin:0;background:#0b0d12;color:#f5f7fb;font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;display:grid;place-items:center;min-height:100vh}
+.card{width:min(92vw,520px);padding:30px;border:1px solid #252a35;border-radius:22px;background:#11141b;box-shadow:0 20px 60px rgba(0,0,0,.35)}
+.brand{font-size:13px;letter-spacing:.18em;text-transform:uppercase;color:#9da7b8}.title{font-size:36px;font-weight:800;margin:8px 0}.sub{color:#9da7b8}.status{display:inline-flex;gap:8px;align-items:center;margin-top:22px;padding:9px 13px;border-radius:999px;background:#171c25;color:#dce4ef;font-size:14px}.dot{width:8px;height:8px;border-radius:50%;background:#6ee7a0}
+</style></head><body><main class="card"><div class="brand">XHOST // CLOUD HOST</div><div class="title">Service Online</div><div class="sub">Telegram hosting gateway is running.</div><div class="status"><span class="dot"></span> Proxy ready</div></main></body></html>""",
+        mimetype='text/html'
+    )
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -80,8 +90,11 @@ verified_users = set()
 web_apps = {}
 WEB_PORT_MIN = int(os.environ.get('WEB_PORT_MIN', '10000'))
 WEB_PORT_MAX = int(os.environ.get('WEB_PORT_MAX', '20000'))
-PUBLIC_BASE_URL = (os.environ.get('PUBLIC_BASE_URL') or
-                   os.environ.get('RENDER_EXTERNAL_URL') or
+# Prefer Render's own service URL so the web-app button always points at
+# the XHOST service that is actually running this proxy. PUBLIC_BASE_URL
+# remains available as a fallback for other hosting providers.
+PUBLIC_BASE_URL = (os.environ.get('RENDER_EXTERNAL_URL') or
+                   os.environ.get('PUBLIC_BASE_URL') or
                    os.environ.get('RENDER_EXTERNAL_HOSTNAME'))
 if PUBLIC_BASE_URL and not PUBLIC_BASE_URL.startswith(('http://', 'https://')):
     PUBLIC_BASE_URL = 'https://' + PUBLIC_BASE_URL
@@ -95,19 +108,19 @@ logger = logging.getLogger(__name__)
 
 # --- Button layouts ---
 COMMAND_BUTTONS_LAYOUT_USER_SPEC = [
-    ["📢 Updates Channel"],
-    ["📤 Upload File", "📂 Check Files"],
-    ["⚡ Bot Speed", "📊 Statistics"],
-    ["📤 Send Command", "📞 Contact Owner"]
+    ["◈ Updates"],
+    ["＋ Upload", "▣ My Files"],
+    ["⚡ Ping", "◌ Statistics"],
+    ["⌘ Command", "◎ Owner"]
 ]
 ADMIN_COMMAND_BUTTONS_LAYOUT_USER_SPEC = [
-    ["📢 Updates Channel"],
-    ["📤 Upload File", "📂 Check Files"],
-    ["⚡ Bot Speed", "📊 Statistics"],
-    ["💳 Subscriptions", "📢 Broadcast"],
-    ["🔒 Lock Bot", "🟢 Running All Code"],
-    ["📤 Send Command", "👑 Admin Panel"],
-    ["📞 Contact Owner"]
+    ["◈ Updates"],
+    ["＋ Upload", "▣ My Files"],
+    ["⚡ Ping", "◌ Statistics"],
+    ["◇ Premium", "◉ Broadcast"],
+    ["🔒 Lock Bot", "▶ Run All"],
+    ["⌘ Command", "⚙ Admin Panel"],
+    ["◎ Owner"]
 ]
 
 # --- Database ---
@@ -519,64 +532,109 @@ def get_web_app_url(script_key):
     return None
 
 def create_web_proxy_routes():
-    """Proxy HTTP requests to registered local web apps.
+    """Proxy registered uploaded web apps through the XHOST public URL.
 
-    This supports normal HTTP routes and Socket.IO polling. Browser websocket
-    upgrades still require a websocket-capable front proxy.
+    Supports normal HTTP routes and Socket.IO polling. WebSocket upgrades are
+    intentionally not required because the Devidciker frontend is rewritten
+    to use polling through this HTTP proxy.
     """
-    @app.route('/web/<token>/', defaults={'subpath': ''}, methods=['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'])
-    @app.route('/web/<token>/<path:subpath>', methods=['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'])
-    def web_app_proxy(token, subpath):
+    def _proxy(token, subpath=''):
         info = web_apps.get(token)
         if not info:
             return 'Web app not found or no longer running.', 404
+
         process_info = bot_scripts.get(info['script_key'])
-        if not process_info or not process_info.get('process') or process_info['process'].poll() is not None:
+        process = process_info.get('process') if process_info else None
+        if not process or process.poll() is not None:
             unregister_web_app(info['script_key'])
             return 'Web app is not running.', 404
 
+        clean_subpath = (subpath or '').lstrip('/')
         target = f"http://127.0.0.1:{info['port']}/"
-        if subpath:
-            target = urljoin(target, subpath)
+        if clean_subpath:
+            target += clean_subpath
+
+        forward_headers = {}
+        for key, value in request.headers.items():
+            low = key.lower()
+            if low not in {'host', 'content-length', 'connection', 'accept-encoding'}:
+                forward_headers[key] = value
+        forward_headers['X-Forwarded-Proto'] = request.headers.get('X-Forwarded-Proto', 'https')
+        forward_headers['X-Forwarded-Host'] = request.host
+        forward_headers['X-Forwarded-Prefix'] = f'/web/{token}'
+
         try:
-            response = requests.request(
-                request.method, target,
+            upstream = requests.request(
+                method=request.method,
+                url=target,
                 params=request.args,
-                data=request.get_data(),
-                headers={k: v for k, v in request.headers if k.lower() not in {'host', 'content-length'}},
+                data=request.get_data(cache=True),
+                headers=forward_headers,
                 cookies=request.cookies,
                 allow_redirects=False,
-                timeout=60
+                timeout=60,
             )
-        except requests.RequestException as e:
-            logger.warning(f"Web proxy error for {info['script_key']}: {e}")
+        except requests.RequestException as exc:
+            logger.warning('Web proxy error for %s: %s', info['script_key'], exc)
             return 'Web app is not responding.', 502
 
-        body = response.content
-        content_type = response.headers.get('Content-Type', '')
-        if 'text/html' in content_type:
-            try:
-                html = body.decode(response.encoding or 'utf-8', errors='ignore')
-                prefix = f"/web/{token}/"
-                html = html.replace('href="/static/', f'href="{prefix}static/')
-                html = html.replace("href='/static/", f"href='{prefix}static/")
-                html = html.replace('src="/static/', f'src="{prefix}static/')
-                html = html.replace("src='/static/", f"src='{prefix}static/")
-                html = html.replace("fetch('/api/", f"fetch('{prefix}api/")
-                html = html.replace('fetch("/api/', f'fetch("{prefix}api/')
-                html = html.replace("window.location.href = '/api/", f"window.location.href = '{prefix}api/")
-                # Force Socket.IO to use HTTP polling through this Flask proxy.
-                html = html.replace("transports: ['websocket', 'polling']", "transports: ['polling']")
-                html = html.replace('const socket = io({', f"const socket = io({{ path: '{prefix}socket.io',")
-                body = html.encode('utf-8')
-            except Exception:
-                pass
+        body = upstream.content
+        content_type = upstream.headers.get('Content-Type', '')
 
-        excluded = {'content-encoding', 'content-length', 'transfer-encoding', 'connection'}
-        out_headers = [(k, v) for k, v in response.headers.items() if k.lower() not in excluded]
-        return Response(body, status=response.status_code, headers=out_headers)
+        if 'text/html' in content_type.lower():
+            try:
+                html = body.decode(upstream.encoding or 'utf-8', errors='ignore')
+                prefix = f'/web/{token}/'
+                # Keep the uploaded app's absolute links inside its proxy path.
+                replacements = {
+                    'href="/static/': f'href="{prefix}static/',
+                    "href='/static/": f"href='{prefix}static/",
+                    'src="/static/': f'src="{prefix}static/',
+                    "src='/static/": f"src='{prefix}static/",
+                    'fetch("/api/': f'fetch("{prefix}api/',
+                    "fetch('/api/": f"fetch('{prefix}api/",
+                    'window.location.href = "/api/': f'window.location.href = "{prefix}api/',
+                    "window.location.href = '/api/": f"window.location.href = '{prefix}api/",
+                    "transports: ['websocket', 'polling']": "transports: ['polling']",
+                    'transports: ["websocket", "polling"]': 'transports: ["polling"]',
+                }
+                for old, new in replacements.items():
+                    html = html.replace(old, new)
+
+                # Explicitly route Socket.IO through this app's proxy path.
+                html = html.replace(
+                    'const socket = io({',
+                    f"const socket = io({{ path: '{prefix}socket.io',"
+                )
+                body = html.encode('utf-8')
+            except Exception as exc:
+                logger.debug('HTML rewrite skipped: %s', exc)
+
+        out_headers = []
+        excluded = {'content-encoding', 'content-length', 'transfer-encoding', 'connection', 'keep-alive'}
+        for key, value in upstream.headers.items():
+            if key.lower() in excluded:
+                continue
+            # Rewrite redirects so the browser stays under the proxy path.
+            if key.lower() == 'location' and value.startswith('/'):
+                value = f'/web/{token}{value}'
+            if key.lower() == 'set-cookie':
+                value = re.sub(r'(?i)path=/', f'Path=/web/{token}/', value)
+            out_headers.append((key, value))
+
+        return Response(body, status=upstream.status_code, headers=out_headers)
+
+    @app.route('/web/<token>', methods=['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'])
+    @app.route('/web/<token>/', defaults={'subpath': ''}, methods=['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'])
+    @app.route('/web/<token>/<path:subpath>', methods=['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'])
+    def web_app_proxy(token, subpath=''):
+        return _proxy(token, subpath)
 
 create_web_proxy_routes()
+
+@app.route('/healthz')
+def healthz():
+    return Response('ok', mimetype='text/plain')
 
 def run_script(script_path, script_owner_id, user_folder, file_name, message_obj_for_reply, attempt=1):
     max_attempts = 2
@@ -683,8 +741,8 @@ def run_script(script_path, script_owner_id, user_folder, file_name, message_obj
                 web_url = get_web_app_url(script_key)
                 if web_url:
                     markup = types.InlineKeyboardMarkup()
-                    markup.add(types.InlineKeyboardButton('🌐 Open Web App', url=web_url))
-                    bot.reply_to(message_obj_for_reply, f"✅ Web app '{file_name}' started! (PID: {process.pid})\n\n🌐 Click the button below to open it.", reply_markup=markup)
+                    markup.add(types.InlineKeyboardButton('↗ Open Web App', url=web_url))
+                    bot.reply_to(message_obj_for_reply, f"<b>WEB APP ONLINE</b>\n<code>{file_name}</code> · PID {process.pid}\n\nOpen your app using the button below.", reply_markup=markup)
                 else:
                     bot.reply_to(message_obj_for_reply, f"✅ Web app '{file_name}' started! (PID: {process.pid})\n⚠️ Set PUBLIC_BASE_URL in your hosting environment to enable the Open Web App button.")
             else:
@@ -917,22 +975,22 @@ def remove_admin_db(admin_id):
 def create_main_menu_inline(user_id):
     markup = types.InlineKeyboardMarkup(row_width=2)
     buttons = [
-        types.InlineKeyboardButton('📢 Updates Channel', url=UPDATE_CHANNEL),
-        types.InlineKeyboardButton('📤 Upload File', callback_data='upload'),
-        types.InlineKeyboardButton('📂 Check Files', callback_data='check_files'),
-        types.InlineKeyboardButton('⚡ Bot Speed', callback_data='speed'),
-        types.InlineKeyboardButton('📤 Send Command', callback_data='send_command'),
-        types.InlineKeyboardButton('📞 Contact Owner', url=f'https://t.me/{YOUR_USERNAME.replace("@", "")}')
+        types.InlineKeyboardButton('◈ Updates', url=UPDATE_CHANNEL),
+        types.InlineKeyboardButton('＋ Upload', callback_data='upload'),
+        types.InlineKeyboardButton('▣ My Files', callback_data='check_files'),
+        types.InlineKeyboardButton('⚡ Ping', callback_data='speed'),
+        types.InlineKeyboardButton('⌘ Command', callback_data='send_command'),
+        types.InlineKeyboardButton('◎ Owner', url=f'https://t.me/{YOUR_USERNAME.replace("@", "")}')
     ]
     if user_id in admin_ids:
         admin_buttons = [
-            types.InlineKeyboardButton('💳 Subscriptions', callback_data='subscription'),
-            types.InlineKeyboardButton('📊 Statistics', callback_data='stats'),
+            types.InlineKeyboardButton('◇ Premium', callback_data='subscription'),
+            types.InlineKeyboardButton('◌ Statistics', callback_data='stats'),
             types.InlineKeyboardButton('🔒 Lock Bot' if not bot_locked else '🔓 Unlock Bot',
                                      callback_data='lock_bot' if not bot_locked else 'unlock_bot'),
-            types.InlineKeyboardButton('📢 Broadcast', callback_data='broadcast'),
-            types.InlineKeyboardButton('👑 Admin Panel', callback_data='admin_panel'),
-            types.InlineKeyboardButton('🟢 Run All User Scripts', callback_data='run_all_scripts')
+            types.InlineKeyboardButton('◉ Broadcast', callback_data='broadcast'),
+            types.InlineKeyboardButton('⚙ Admin Panel', callback_data='admin_panel'),
+            types.InlineKeyboardButton('▶ Run All', callback_data='run_all_scripts')
         ]
         markup.add(buttons[0])
         markup.add(buttons[1], buttons[2])
@@ -947,7 +1005,7 @@ def create_main_menu_inline(user_id):
         markup.add(buttons[1], buttons[2])
         markup.add(buttons[3])
         markup.add(buttons[4])
-        markup.add(types.InlineKeyboardButton('📊 Statistics', callback_data='stats'))
+        markup.add(types.InlineKeyboardButton('◌ Statistics', callback_data='stats'))
         markup.add(buttons[5])
     return markup
 
@@ -965,7 +1023,7 @@ def create_control_buttons(script_owner_id, file_name, is_running=True):
     web_url = get_web_app_url(script_key) if script_info.get('web_app') else None
     if is_running:
         if web_url:
-            markup.add(types.InlineKeyboardButton('🌐 Open Web App', url=web_url))
+            markup.add(types.InlineKeyboardButton('↗ Open Web App', url=web_url))
         markup.row(
             types.InlineKeyboardButton("🔴 Stop", callback_data=f'stop_{script_owner_id}_{file_name}'),
             types.InlineKeyboardButton("🔄 Restart", callback_data=f'restart_{script_owner_id}_{file_name}')
@@ -992,7 +1050,7 @@ def create_admin_panel():
         types.InlineKeyboardButton('➖ Remove Admin', callback_data='remove_admin')
     )
     markup.row(types.InlineKeyboardButton('📋 List Admins', callback_data='list_admins'))
-    markup.row(types.InlineKeyboardButton('🔙 Back to Main', callback_data='back_to_main'))
+    markup.row(types.InlineKeyboardButton('‹ Back to Main', callback_data='back_to_main'))
     return markup
 
 def create_subscription_menu():
@@ -1002,7 +1060,7 @@ def create_subscription_menu():
         types.InlineKeyboardButton('➖ Remove Subscription', callback_data='remove_subscription')
     )
     markup.row(types.InlineKeyboardButton('🔍 Check Subscription', callback_data='check_subscription'))
-    markup.row(types.InlineKeyboardButton('🔙 Back to Main', callback_data='back_to_main'))
+    markup.row(types.InlineKeyboardButton('‹ Back to Main', callback_data='back_to_main'))
     return markup
 
 def create_send_command_menu():
@@ -1011,7 +1069,7 @@ def create_send_command_menu():
         types.InlineKeyboardButton('📝 Send to Process', callback_data='send_to_process'),
         types.InlineKeyboardButton('🔍 View All Logs', callback_data='view_all_logs')
     )
-    markup.row(types.InlineKeyboardButton('🔙 Back to Main', callback_data='back_to_main'))
+    markup.row(types.InlineKeyboardButton('‹ Back to Main', callback_data='back_to_main'))
     return markup
 # --- End Menu Creation ---
 
@@ -1026,7 +1084,7 @@ def get_app_python(user_folder):
 
 
 def install_requirements_isolated(user_folder, req_path, message):
-    """Install an uploaded app's requirements into its own venv with a hard timeout."""
+    """Install uploaded-app requirements into its own venv with a hard timeout."""
     import venv
     venv_dir = os.path.join(user_folder, '.venv')
     try:
@@ -1041,31 +1099,22 @@ def install_requirements_isolated(user_folder, req_path, message):
         command = [app_python, '-m', 'pip', 'install', '--disable-pip-version-check',
                    '--prefer-binary', '-r', req_path]
         logger.info("Installing app requirements: %s", ' '.join(command))
-        proc = subprocess.Popen(command, cwd=user_folder, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True, encoding='utf-8',
-                                errors='ignore', bufsize=1)
-        output = []
-        started = time.time()
-        while True:
-            line = proc.stdout.readline() if proc.stdout else ''
-            if line:
-                line = line.rstrip()
-                output.append(line)
-                logger.info("[app pip] %s", line)
-            elif proc.poll() is not None:
-                break
-            elif time.time() - started > 300:
-                proc.kill()
-                proc.wait(timeout=5)
-                raise TimeoutError("Dependency installation timed out after 5 minutes.")
-            else:
-                time.sleep(0.1)
-        rc = proc.returncode
-        if rc != 0:
-            tail = '\n'.join(output[-25:])
-            raise RuntimeError(tail or f"pip exited with code {rc}")
+        result = subprocess.run(
+            command, cwd=user_folder, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding='utf-8', errors='ignore', timeout=300, check=False
+        )
+        output = result.stdout or ''
+        for line in output.splitlines()[-80:]:
+            logger.info('[app pip] %s', line)
+        if result.returncode != 0:
+            tail = '\n'.join(output.splitlines()[-30:])
+            raise RuntimeError(tail or f"pip exited with code {result.returncode}")
         bot.reply_to(message, "✅ Python deps installed.")
         return app_python
+    except subprocess.TimeoutExpired:
+        logger.error("Isolated dependency installation timed out after 5 minutes.")
+        bot.reply_to(message, "❌ Python dependency installation timed out after 5 minutes.")
+        return None
     except Exception as e:
         logger.error("Isolated dependency installation failed", exc_info=True)
         err = str(e)
@@ -1342,25 +1391,25 @@ def _logic_send_welcome(message):
             remove_subscription_db(user_id)
     else: user_status = "🆓 Free User"
 
-    welcome_msg_text = (f"〽️ Welcome, {user_name}!\n\n🆔 Your User ID: `{user_id}`\n"
-                        f"✳️ Username: `@{user_username or 'Not set'}`\n"
-                        f"🔰 Your Status: {user_status}{expiry_info}\n"
-                        f"📁 Files Uploaded: {current_files} / {limit_str}\n\n"
-                        f"🤖 Host & run Python (`.py`) or JS (`.js`) scripts.\n\n"
-                        f"👇 Use buttons or type commands.")
+    welcome_msg_text = (f"<b>XHOST // CLOUD HOST</b>\n\n"
+                        f"Welcome, <b>{user_name}</b>.\n"
+                        f"<code>ID {user_id}</code> · {user_status}{expiry_info}\n"
+                        f"Files: <b>{current_files} / {limit_str}</b>\n\n"
+                        f"Run Python, JavaScript, and supported web apps directly from Telegram.\n\n"
+                        f"Choose an action below.")
     main_reply_markup = create_reply_keyboard_main_menu(user_id)
     try:
         if photo_file_id: bot.send_photo(chat_id, photo_file_id)
-        bot.send_message(chat_id, welcome_msg_text, reply_markup=main_reply_markup, parse_mode='Markdown')
+        bot.send_message(chat_id, welcome_msg_text, reply_markup=main_reply_markup, parse_mode='HTML')
     except Exception as e:
         logger.error(f"Welcome send error: {e}")
-        try: bot.send_message(chat_id, welcome_msg_text, reply_markup=main_reply_markup, parse_mode='Markdown')
+        try: bot.send_message(chat_id, welcome_msg_text, reply_markup=main_reply_markup, parse_mode='HTML')
         except Exception as fe: logger.error(f"Fallback failed: {fe}")
 
 @require_verification
 def _logic_updates_channel(message):
     markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton('📢 Updates Channel', url=UPDATE_CHANNEL))
+    markup.add(types.InlineKeyboardButton('◈ Updates', url=UPDATE_CHANNEL))
     bot.reply_to(message, "Visit our Updates Channel:", reply_markup=markup)
 
 @require_verification
@@ -1420,7 +1469,7 @@ def _logic_bot_speed(message):
 @require_verification
 def _logic_contact_owner(message):
     markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton('📞 Contact Owner', url=f'https://t.me/{YOUR_USERNAME.replace("@", "")}'))
+    markup.add(types.InlineKeyboardButton('◎ Owner', url=f'https://t.me/{YOUR_USERNAME.replace("@", "")}'))
     bot.reply_to(message, "Click to contact Owner:", reply_markup=markup)
 
 # --- Admin Logic ---
@@ -1562,6 +1611,20 @@ def command_show_status(message):
     _logic_statistics(message)
 
 BUTTON_TEXT_TO_LOGIC = {
+    # Current clean UI labels
+    "◈ Updates": _logic_updates_channel,
+    "＋ Upload": _logic_upload_file,
+    "▣ My Files": _logic_check_files,
+    "⚡ Ping": _logic_bot_speed,
+    "◌ Statistics": _logic_statistics,
+    "⌘ Command": _logic_send_command,
+    "◎ Owner": _logic_contact_owner,
+    "◇ Premium": _logic_subscriptions_panel,
+    "◉ Broadcast": _logic_broadcast_init,
+    "🔒 Lock Bot": _logic_toggle_lock_bot,
+    "▶ Run All": _logic_run_all_scripts,
+    "⚙ Admin Panel": _logic_admin_panel,
+    # Backward-compatible labels
     "📢 Updates Channel": _logic_updates_channel,
     "📤 Upload File": _logic_upload_file,
     "📂 Check Files": _logic_check_files,
@@ -1571,10 +1634,10 @@ BUTTON_TEXT_TO_LOGIC = {
     "📊 Statistics": _logic_statistics,
     "💳 Subscriptions": _logic_subscriptions_panel,
     "📢 Broadcast": _logic_broadcast_init,
-    "🔒 Lock Bot": _logic_toggle_lock_bot,
     "🟢 Running All Code": _logic_run_all_scripts,
     "👑 Admin Panel": _logic_admin_panel,
 }
+
 
 @bot.message_handler(func=lambda message: message.text in BUTTON_TEXT_TO_LOGIC)
 def handle_button_text(message):
